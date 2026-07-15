@@ -1,0 +1,439 @@
+version: "3.9"
+
+# =============================================================================
+# UtilityPay 开发环境 - Docker Compose
+# 一键启动全栈基础设施：ClickHouse, Redis, Kafka, RustFS, Elasticsearch, Airflow
+# 使用方式: docker compose up -d
+# =============================================================================
+
+x-common-healthcheck: &common-healthcheck
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+services:
+  # ===========================================================================
+  # ClickHouse - 列式 OLAP 数据库
+  # ===========================================================================
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: utilitypay-clickhouse
+    hostname: clickhouse
+    ports:
+      - "8123:8123"   # HTTP 接口
+      - "9000:9000"   # Native 协议
+      - "9009:9009"   # 集群间通信
+    environment:
+      CLICKHOUSE_DB: utilitypay
+      CLICKHOUSE_USER: utilitypay
+      CLICKHOUSE_PASSWORD: utilitypay_dev
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./infrastructure/clickhouse/init:/docker-entrypoint-initdb.d:ro
+      - ./infrastructure/clickhouse/config:/etc/clickhouse-server/config.d:ro
+    ulimits:
+      nofile: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "utilitypay", "--password", "utilitypay_dev", "--query", "SELECT 1"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  # ===========================================================================
+  # Redis - 缓存与分布式锁
+  # ===========================================================================
+  redis:
+    image: redis:7.4-alpine
+    container_name: utilitypay-redis
+    hostname: redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --requirepass redis_dev
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "redis_dev", "ping"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  # ===========================================================================
+  # Kafka - 消息队列 (KRaft 模式，无需 Zookeeper)
+  # ===========================================================================
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: utilitypay-kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"   # 内部通信
+      - "9093:9093"   # 外部访问 (localhost)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  # ===========================================================================
+  # Kafka UI - Web 管理界面
+  # ===========================================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: utilitypay-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8088:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: utilitypay-dev
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  # ===========================================================================
+  # RustFS - S3 兼容对象存储 (MinIO 作为 RustFS 的替代实现)
+  # 注: RustFS 社区版尚未发布稳定 Docker 镜像，开发环境使用 MinIO 兼容 S3 API
+  # 生产环境可替换为 RustFS 原生部署
+  # ===========================================================================
+  rustfs:
+    image: minio/minio:RELEASE.2024-07-15T00-00-00Z
+    container_name: utilitypay-rustfs
+    hostname: rustfs
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web Console
+    environment:
+      MINIO_ROOT_USER: utilitypay_admin
+      MINIO_ROOT_PASSWORD: utilitypay_dev123
+    command: server /data --console-address ":9001"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  # RustFS 初始化 - 创建 Bucket
+  rustfs-init:
+    image: minio/mc:latest
+    container_name: utilitypay-rustfs-init
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set rustfs http://rustfs:9000 utilitypay_admin utilitypay_dev123;
+      mc mb --ignore-existing rustfs/utilitypay-invoices;
+      mc mb --ignore-existing rustfs/utilitypay-contracts;
+      mc mb --ignore-existing rustfs/utilitypay-archive;
+      mc mb --ignore-existing rustfs/utilitypay-airflow-dags;
+      echo 'RustFS buckets initialized successfully';
+      "
+    networks:
+      - utilitypay-net
+
+  # ===========================================================================
+  # Elasticsearch - 全文检索与向量存储
+  # ===========================================================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
+    container_name: utilitypay-elasticsearch
+    hostname: elasticsearch
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+      xpack.security.enabled: "false"
+      xpack.security.enrollment.enabled: "false"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE 'green|yellow'"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile: 65536
+
+  # ===========================================================================
+  # Kibana - Elasticsearch 可视化
+  # ===========================================================================
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.14.3
+    container_name: utilitypay-kibana
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  # ===========================================================================
+  # Apache Airflow - 工作流调度
+  # ===========================================================================
+  airflow-postgres:
+    image: postgres:16-alpine
+    container_name: utilitypay-airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  airflow-redis:
+    image: redis:7.4-alpine
+    container_name: utilitypay-airflow-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - airflow-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  airflow-webserver:
+    image: apache/airflow:2.9.3-python3.11
+    container_name: utilitypay-airflow-webserver
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-redis:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://airflow-redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+      _AIRFLOW_WWW_USER_ROLE: Admin
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/plugins:/opt/airflow/plugins:ro
+      - ./airflow/logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+      airflow db init &&
+      airflow users create --username airflow --password airflow --firstname Admin --lastname User --role Admin --email admin@utilitypay.local 2>/dev/null || true &&
+      airflow webserver
+      "
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.3-python3.11
+    container_name: utilitypay-airflow-scheduler
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-redis:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://airflow-redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/plugins:/opt/airflow/plugins:ro
+      - ./airflow/logs:/opt/airflow/logs
+    command: airflow scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $$(hostname)"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  airflow-worker:
+    image: apache/airflow:2.9.3-python3.11
+    container_name: utilitypay-airflow-worker
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-redis:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CELERY__BROKER_URL: redis://airflow-redis:6379/0
+      AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/plugins:/opt/airflow/plugins:ro
+      - ./airflow/logs:/opt/airflow/logs
+    command: airflow celery worker
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A airflow.executors.celery_executor.app inspect ping -d celery@$$(hostname)"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  # ===========================================================================
+  # Prometheus - 监控指标采集
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    container_name: utilitypay-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  # ===========================================================================
+  # Grafana - 监控仪表盘
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: utilitypay-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infrastructure/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./infrastructure/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      <<: *common-healthcheck
+    networks:
+      - utilitypay-net
+    logging: *default-logging
+
+  # ===========================================================================
+  # 数据库初始化工具 - 创建 ClickHouse 表结构
+  # ===========================================================================
+  db-migrator:
+    image: clickhouse/clickhouse-client:24.3-alpine
+    container_name: utilitypay-db-migrator
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./infrastructure/clickhouse/migrations:/migrations:ro
+    entrypoint: >
+      /bin/sh -c "
+      for f in /migrations/*.sql; do
+        echo \"Running: $$f\";
+        clickhouse-client --host clickhouse --user utilitypay --password utilitypay_dev --database utilitypay --multiquery < \"$$f\";
+      done;
+      echo 'All migrations completed successfully';
+      "
+    networks:
+      - utilitypay-net
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  clickhouse-data:
+    name: utilitypay-clickhouse-data
+  redis-data:
+    name: utilitypay-redis-data
+  kafka-data:
+    name: utilitypay-kafka-data
+  rustfs-data:
+    name: utilitypay-rustfs-data
+  es-data:
+    name: utilitypay-es-data
+  airflow-db-data:
+    name: utilitypay-airflow-db-data
+  airflow-redis-data:
+    name: utilitypay-airflow-redis-data
+  prometheus-data:
+    name: utilitypay-prometheus-data
+  grafana-data:
+    name: utilitypay-grafana-data
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  utilitypay-net:
+    name: utilitypay-net
+    driver: bridge

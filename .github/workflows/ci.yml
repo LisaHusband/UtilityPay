@@ -1,0 +1,391 @@
+name: CI Pipeline
+
+# =============================================================================
+# UtilityPay CI/CD 流水线
+# 触发条件: push/PR 到 main/develop 分支
+# 包含: 静态代码检查、单元测试、集成测试、构建验证
+# =============================================================================
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "release/**"
+  pull_request:
+    branches:
+      - main
+      - develop
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "17"
+  NODE_VERSION: "20"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true"
+
+jobs:
+  # ===========================================================================
+  # Job 1: 静态代码检查 (Lint)
+  # ===========================================================================
+  lint:
+    name: Static Analysis & Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Java 后端静态检查 ----
+      - name: Setup Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: "temurin"
+          cache: gradle
+
+      - name: Checkstyle (Java Code Style)
+        run: ./gradlew checkstyleMain checkstyleTest --no-daemon
+
+      - name: PMD (Java Static Analysis)
+        run: ./gradlew pmdMain pmdTest --no-daemon
+
+      - name: SpotBugs (Java Bug Detection)
+        run: ./gradlew spotbugsMain spotbugsTest --no-daemon
+
+      - name: Spotless Check (Java Format)
+        run: ./gradlew spotlessCheck --no-daemon
+
+      - name: Upload Java Lint Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-lint-reports
+          path: |
+            **/build/reports/checkstyle/
+            **/build/reports/pmd/
+            **/build/reports/spotbugs/
+          retention-days: 7
+
+      # ---- 前端静态检查 ----
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Install Frontend Dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: ESLint (JS/TS Lint)
+        working-directory: frontend
+        run: pnpm lint
+
+      - name: Prettier Check (Frontend Format)
+        working-directory: frontend
+        run: pnpm format:check
+
+      - name: TypeScript Type Check
+        working-directory: frontend
+        run: pnpm typecheck
+
+      # ---- Dockerfile 静态检查 ----
+      - name: Run hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+      # ---- Markdown 静态检查 ----
+      - name: Run markdownlint
+        uses: articulate/actions-markdownlint@v1
+        with:
+          config: .markdownlint.json
+          files: "docs/**/*.md *.md"
+          ignore: "CHANGELOG.md"
+
+      # ---- YAML 静态检查 ----
+      - name: Run yamllint
+        uses: karancode/yamllint-github-action@v3
+        with:
+          yamllint_strict: "false"
+          yamllint_config_datapath: ".yamllint.yml"
+
+  # ===========================================================================
+  # Job 2: 后端单元测试 + 覆盖率
+  # ===========================================================================
+  backend-test:
+    name: Backend Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: lint
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.3-alpine
+        env:
+          CLICKHOUSE_DB: utilitypay_test
+          CLICKHOUSE_USER: test
+          CLICKHOUSE_PASSWORD: test
+        ports:
+          - 8123:8123
+          - 9000:9000
+        options: >-
+          --ulimit nofile=262144
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: "temurin"
+          cache: gradle
+
+      - name: Run Unit Tests
+        run: ./gradlew test --no-daemon
+        env:
+          SPRING_PROFILES_ACTIVE: test
+          CLICKHOUSE_HOST: localhost
+          CLICKHOUSE_PORT: 8123
+          CLICKHOUSE_USER: test
+          CLICKHOUSE_PASSWORD: test
+
+      - name: Generate JaCoCo Coverage Report
+        run: ./gradlew jacocoTestReport --no-daemon
+
+      - name: Check Coverage Threshold
+        run: ./gradlew jacocoTestCoverageVerification --no-daemon
+
+      - name: Upload Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-reports
+          path: |
+            **/build/reports/tests/
+            **/build/reports/jacoco/
+          retention-days: 7
+
+      - name: Publish Test Results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Backend Tests
+          path: "**/build/test-results/test/TEST-*.xml"
+          reporter: java-junit
+          fail-on-error: "false"
+
+  # ===========================================================================
+  # Job 3: 前端测试
+  # ===========================================================================
+  frontend-test:
+    name: Frontend Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: lint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Install Dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Unit Tests
+        working-directory: frontend
+        run: pnpm test -- --coverage
+
+      - name: Upload Coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          retention-days: 7
+
+  # ===========================================================================
+  # Job 4: 构建验证 (确保项目可编译)
+  # ===========================================================================
+  build:
+    name: Build Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+      - backend-test
+      - frontend-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: "temurin"
+          cache: gradle
+
+      - name: Build Backend (without tests)
+        run: ./gradlew build -x test -x integrationTest --no-daemon
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Install & Build Frontend
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Upload Backend Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-jars
+          path: "**/build/libs/*.jar"
+          retention-days: 3
+
+  # ===========================================================================
+  # Job 5: Docker 镜像构建验证
+  # ===========================================================================
+  docker-build:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: utilitypay:ci-test
+
+  # ===========================================================================
+  # Job 6: 依赖安全扫描
+  # ===========================================================================
+  security-scan:
+    name: Dependency Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: lint
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: "temurin"
+          cache: gradle
+
+      - name: Gradle Dependency Check (OWASP)
+        run: ./gradlew dependencyCheckAnalyze --no-daemon
+
+      - name: Upload Dependency Check Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: build/reports/dependency-check-report.html
+          retention-days: 7
+
+      - name: Trivy File System Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+
+      - name: Upload Trivy Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+  # ===========================================================================
+  # Job 7: 最终状态检查 (用于分支保护规则)
+  # ===========================================================================
+  ci-status:
+    name: CI Status Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs:
+      - lint
+      - backend-test
+      - frontend-test
+      - build
+      - docker-build
+      - security-scan
+    if: always()
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          echo "## CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| backend-test | ${{ needs.backend-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| frontend-test | ${{ needs.frontend-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| docker-build | ${{ needs.docker-build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| security-scan | ${{ needs.security-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.lint.result }}" != "success" ] || \
+             [ "${{ needs.backend-test.result }}" != "success" ] || \
+             [ "${{ needs.frontend-test.result }}" != "success" ] || \
+             [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.docker-build.result }}" != "success" ] || \
+             [ "${{ needs.security-scan.result }}" != "success" ]; then
+            echo "❌ Some CI jobs failed!" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "✅ All CI jobs passed!" >> $GITHUB_STEP_SUMMARY
